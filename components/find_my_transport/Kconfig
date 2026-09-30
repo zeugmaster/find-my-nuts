@@ -1,0 +1,38 @@
+menu "Find My transport"
+
+    config FIND_MY_TRANSPORT_MODEM_ID
+        hex "Public modem identifier"
+        default 0x4E555453
+        help
+            Four-byte public routing identifier (default ASCII "NUTS").
+            It is embedded in every candidate public key and is not a secret.
+            Configure the receiver with the same hexadecimal value.
+
+    config FIND_MY_TRANSPORT_ADV_INTERVAL_MS
+        int "BLE advertising interval (milliseconds)"
+        range 20 10240
+        default 1000
+        help
+            Interval between non-connectable BLE advertisements for a symbol.
+            ESP32 rounds this value to BLE's 0.625 ms controller units.
+
+    config FIND_MY_TRANSPORT_SYMBOL_DWELL_MS
+        int "Dwell time per 2-bit symbol (milliseconds)"
+        range 20 60000
+        default 1600
+        help
+            Time each candidate key remains on air. Keep this at least as long
+            as the advertising interval so every symbol gets an opportunity to
+            be transmitted. Four symbols encode each source byte.
+
+    config FIND_MY_TRANSPORT_HEADER_REPEATS
+        int "FMN1 header copies per body pass"
+        range 1 32
+        default 8
+        help
+            Number of times the fixed 40-symbol FMN1 header is aired during
+            each complete body pass. Copies are distributed across the pass,
+            allowing receivers to learn the exact frame length reliably even
+            when relay coverage is intermittent.
+
+endmenu

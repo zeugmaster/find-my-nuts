@@ -328,10 +328,12 @@ bool keyset_run_tests()
         ks.unit = "sat";
         ks.keys = bls_keys;
         ks.keys[4] = bls_keys.at(1); // reuse amount-1 key
+        Keyset distinct;
+        distinct.keys = bls_keys;
         if (keyset_keys_distinct(ks)) {
             ESP_LOGE(TAG, "keyset_keys_distinct FAIL: duplicate not detected");
             ok = false;
-        } else if (!keyset_keys_distinct({.keys = bls_keys})) {
+        } else if (!keyset_keys_distinct(distinct)) {
             ESP_LOGE(TAG, "keyset_keys_distinct FAIL: false positive");
             ok = false;
         } else {

@@ -61,6 +61,12 @@ bool from_json_array(const cJSON* arr, std::vector<T>& out) {
 
 // Convenience: serialize to JSON string. Returns "" on allocation failure;
 // callers sending requests must treat that as an error, not as a body.
+// Keysets use a dedicated low-heap overload: constructing a cJSON tree for
+// the usual 64 public keys and then growing its print buffer can exhaust a
+// classic ESP32 with no PSRAM while a mint response is still resident.
+std::string serialize(const Keyset& v);
+std::string serialize(const MintRequest& v);
+
 template<typename T>
 std::string serialize(const T& v) {
     cJSON* j = to_json(v);
@@ -108,4 +114,3 @@ bool deserialize_token_v3(const char* token_str, Token& out);
 bool deserialize_token(const char* token_str, Token& out);
 
 } // namespace cashu
-

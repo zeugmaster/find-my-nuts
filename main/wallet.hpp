@@ -36,7 +36,11 @@ public:
     int calculate_fee(const std::vector<Proof>& inputs) const;
     static std::vector<int> split_amount(int amount);
 
-    static std::string load_mint_url_for_slot(int slot);
+    // Tri-state NVS lookup: true means the lookup itself was unambiguous;
+    // `found` then distinguishes a configured slot from ESP_ERR_NVS_NOT_FOUND.
+    // Any other NVS/read/allocation error returns false so boot can fail closed.
+    static bool load_mint_url_for_slot(int slot, std::string& url_out,
+                                       bool& found);
 
     // NUT-13: Deterministic seed management (global, shared across wallets)
     static bool load_seed();
@@ -104,6 +108,13 @@ public:
                           MintQuote& quote_out);
     // Mints `amount` against quote.unit's active keyset via /v1/mint/{quote.method}.
     bool mint_tokens(const MintQuote& quote, int amount);
+    // Mint an exact caller-supplied output distribution. Every amount must be
+    // positive and published by the active keyset. Validation happens before
+    // blinding or the network request. When non-null, `newly_minted` receives
+    // only the proofs created by this call (and is cleared on failure).
+    bool mint_tokens(const MintQuote& quote,
+                     const std::vector<int>& exact_amounts,
+                     std::vector<Proof>* newly_minted = nullptr);
 
     // NUT-05: Melt tokens, method-generic. `amount` is the PR#382 optional
     // request amount for amountless payment targets (custom methods);
@@ -192,4 +203,3 @@ private:
 };
 
 } // namespace cashu
-

@@ -1,4 +1,18 @@
-menu "Nucula"
+menu "Find My Nuts"
+
+    choice FIND_MY_BOARD
+        prompt "Wallet board"
+        default BOARD_HELTEC_V3 if IDF_TARGET_ESP32S3
+        default BOARD_TDISPLAY
+
+        config BOARD_TDISPLAY
+            bool "Original TTGO T-Display (ESP32, ST7789)"
+            depends on IDF_TARGET_ESP32
+
+        config BOARD_HELTEC_V3
+            bool "Heltec WiFi LoRa 32 V3 (ESP32-S3, SSD1306)"
+            depends on IDF_TARGET_ESP32S3
+    endchoice
 
     config NUCULA_SELFTEST_ON_BOOT
         bool "Run crypto/keyset self-tests at every boot"
@@ -8,5 +22,30 @@ menu "Nucula"
             derivation self-tests during app_main. Costs roughly a second
             of boot time; the same tests are always available at runtime
             via the 'selftest' console command.
+
+    config NUCULA_MAX_DISTRIBUTION_PROOFS
+        int "Maximum proofs in one custom mint distribution"
+        range 1 128
+        default 32
+        help
+            Bounds d=<distribution> parsing and the RAM/NVS used by a single
+            mint operation. A one-satoshi giveaway should stay deliberately
+            small; later Find My activations export one proof at a time.
+
+    config FIND_MY_OUTBOX_CAPACITY
+        int "Durable one-proof token slots"
+        range 1 64
+        default 16
+        help
+            Number of serialized one-proof Cashu tokens retained in NVS.
+            Completed entries remain stored because Find My has no delivery
+            acknowledgement and forgetting a bearer token can lose funds.
+
+    config FIND_MY_MAX_TOKEN_BYTES
+        int "Maximum serialized bytes per one-proof token"
+        range 256 4096
+        default 1536
+        help
+            Maximum cashuB string length accepted into one outbox slot.
 
 endmenu

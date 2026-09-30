@@ -206,6 +206,126 @@ bool from_json(const cJSON* j, Keyset& out) {
     return true;
 }
 
+// Persist keysets without first duplicating all 64 denomination keys into a
+// cJSON tree.  On the no-PSRAM T-Display that tree plus cJSON's growing print
+// buffer can exceed the largest free heap block immediately after /v1/keys.
+// Reserving one final-sized std::string keeps peak scratch memory close to the
+// serialized blob itself.  Keep this JSON-compatible so existing NVS entries
+// and the normal from_json path remain valid across firmware upgrades.
+static size_t json_escaped_size(const std::string& value)
+{
+    size_t size = 2; // surrounding quotes
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\' || ch == '\b' || ch == '\f'
+            || ch == '\n' || ch == '\r' || ch == '\t') {
+            size += 2;
+        } else if (ch < 0x20) {
+            size += 6; // \\u00XX
+        } else {
+            size += 1;
+        }
+    }
+    return size;
+}
+
+static void append_json_string(std::string& out, const std::string& value)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    out.push_back('"');
+    for (unsigned char ch : value) {
+        switch (ch) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (ch < 0x20) {
+                out += "\\u00";
+                out.push_back(hex[ch >> 4]);
+                out.push_back(hex[ch & 0x0f]);
+            } else {
+                out.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+}
+
+std::string serialize(const Keyset& v)
+{
+    size_t capacity = 96 + json_escaped_size(v.id)
+                       + json_escaped_size(v.unit);
+    for (const auto& [amount, pubkey] : v.keys) {
+        capacity += 3 + json_escaped_size(std::to_string(amount))
+                      + json_escaped_size(pubkey);
+    }
+
+    std::string out;
+    out.reserve(capacity);
+    out += "{\"id\":";
+    append_json_string(out, v.id);
+    out += ",\"unit\":";
+    append_json_string(out, v.unit);
+    out += ",\"active\":";
+    out += v.active ? "true" : "false";
+    out += ",\"input_fee_ppk\":";
+    out += std::to_string(v.input_fee_ppk);
+    if (v.final_expiry) {
+        out += ",\"final_expiry\":";
+        out += std::to_string(*v.final_expiry);
+    }
+    out += ",\"keys\":{";
+    bool first = true;
+    for (const auto& [amount, pubkey] : v.keys) {
+        if (!first)
+            out.push_back(',');
+        first = false;
+        append_json_string(out, std::to_string(amount));
+        out.push_back(':');
+        append_json_string(out, pubkey);
+    }
+    out += "}}";
+    return out;
+}
+
+// A many-proof claim otherwise builds and frees a cJSON node tree immediately
+// before TLS needs one contiguous ~4.5 KB transmit allocation. Directly
+// emitting the small, fixed NUT-04 schema avoids that fragmentation spike.
+std::string serialize(const MintRequest& v)
+{
+    size_t capacity = 32 + json_escaped_size(v.quote);
+    for (const auto& output : v.outputs) {
+        capacity += 40 + json_escaped_size(output.B_)
+                       + json_escaped_size(output.id)
+                       + std::to_string(output.amount).size();
+    }
+
+    std::string out;
+    out.reserve(capacity);
+    out += "{\"quote\":";
+    append_json_string(out, v.quote);
+    out += ",\"outputs\":[";
+    bool first = true;
+    for (const auto& output : v.outputs) {
+        if (!first)
+            out.push_back(',');
+        first = false;
+        out += "{\"amount\":";
+        out += std::to_string(output.amount);
+        out += ",\"B_\":";
+        append_json_string(out, output.B_);
+        out += ",\"id\":";
+        append_json_string(out, output.id);
+        out.push_back('}');
+    }
+    out += "]}";
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // KeysetInfo
 // ---------------------------------------------------------------------------
@@ -654,6 +774,41 @@ bool cashu_json_run_tests()
                && info.mint_methods[0].min_amount
                && *info.mint_methods[0].min_amount == 1
                && info.melt_methods.size() == 1);
+    }
+    { // NVS keyset encoder: round-trip fields and JSON escaping.
+        Keyset original;
+        original.id = "00test\\\"id";
+        original.unit = "sat\nunit";
+        original.active = true;
+        original.input_fee_ppk = 7;
+        original.final_expiry = 1753000000;
+        original.keys.emplace(1, "02abc\\def");
+        original.keys.emplace(2, "03def\tghi");
+
+        const std::string encoded = serialize(original);
+        Keyset decoded;
+        expect("keyset persistence JSON",
+               !encoded.empty() && deserialize(encoded.c_str(), decoded)
+               && decoded.id == original.id && decoded.unit == original.unit
+               && decoded.active == original.active
+               && decoded.input_fee_ppk == original.input_fee_ppk
+               && decoded.final_expiry == original.final_expiry
+               && decoded.keys == original.keys);
+    }
+    { // Low-heap NUT-04 encoder must remain byte-compatible with cJSON.
+        MintRequest request{
+            "quote\\\"id",
+            {{1, "02abc\\def", "00keyset"},
+             {2, "03def\tghi", "00keyset"}},
+        };
+        cJSON* expected_json = to_json(request);
+        char* expected_raw = expected_json
+            ? cJSON_PrintUnformatted(expected_json) : nullptr;
+        const std::string encoded = serialize(request);
+        expect("mint request persistence JSON",
+               expected_raw && encoded == expected_raw);
+        if (expected_raw) cJSON_free(expected_raw);
+        if (expected_json) cJSON_Delete(expected_json);
     }
     return ok;
 }

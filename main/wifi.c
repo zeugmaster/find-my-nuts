@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -16,31 +17,46 @@
  * reconnects on a fixed cadence and never gives up. */
 #define FAST_RETRY_COUNT      3
 #define SUPERVISOR_PERIOD_MS  30000
+#define WIFI_FIND_MY_GUARD_BIT BIT1
 
 static const char *TAG = "wifi";
 static EventGroupHandle_t s_event_group;
+static TaskHandle_t s_supervisor_task;
 static int s_retry_count;
-static bool s_connected;
+
+static bool event_bit_is_set(EventBits_t bit)
+{
+    return s_event_group && (xEventGroupGetBits(s_event_group) & bit) != 0;
+}
 
 static void wifi_supervisor_task(void *arg)
 {
     (void)arg;
-    bool was_connected = false;
+    bool was_connected = wifi_is_connected();
     for (;;) {
-        if (!s_connected) {
+        // WIFI_EVENT_STA_START owns the initial connect, and disconnect events
+        // own the fast retries. Starting this loop immediately used to race
+        // that first attempt and emit ESP_ERR_WIFI_CONN at every boot.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
+
+        const bool connected = wifi_is_connected();
+        if (!connected) {
             if (was_connected) {
                 /* Falling edge: the cached HTTP connections are dead. Done
                  * here (not in the event handler) because closing blocks on
                  * the HTTP mutex until any in-flight request finishes. */
                 http_close_all();
             }
-            ESP_LOGI(TAG, "supervisor: attempting reconnect");
-            esp_err_t err = esp_wifi_connect();
-            if (err != ESP_OK && err != ESP_ERR_WIFI_CONN)
-                ESP_LOGW(TAG, "esp_wifi_connect() returned %d", err);
+            if (!event_bit_is_set(WIFI_FIND_MY_GUARD_BIT)) {
+                ESP_LOGI(TAG, "supervisor: attempting reconnect");
+                esp_err_t err = esp_wifi_connect();
+                if (err != ESP_OK && err != ESP_ERR_WIFI_CONN)
+                    ESP_LOGW(TAG, "esp_wifi_connect() returned %d", err);
+            } else {
+                ESP_LOGI(TAG, "supervisor: reconnect deferred for Find My");
+            }
         }
-        was_connected = s_connected;
-        vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
+        was_connected = connected;
     }
 }
 
@@ -53,12 +69,14 @@ static void event_handler(void *arg, esp_event_base_t base,
         wifi_event_sta_disconnected_t *event =
             (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "disconnected, reason: %d", event->reason);
-        s_connected = false;
         xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT);
-        if (s_retry_count < FAST_RETRY_COUNT) {
+        if (!event_bit_is_set(WIFI_FIND_MY_GUARD_BIT)
+            && s_retry_count < FAST_RETRY_COUNT) {
             s_retry_count++;
             ESP_LOGI(TAG, "fast retry (%d/%d)", s_retry_count, FAST_RETRY_COUNT);
             esp_wifi_connect();
+        } else if (event_bit_is_set(WIFI_FIND_MY_GUARD_BIT)) {
+            ESP_LOGI(TAG, "reconnect deferred while Find My is active");
         }
         /* After FAST_RETRY_COUNT the supervisor task takes over. */
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -87,7 +105,6 @@ static void event_handler(void *arg, esp_event_base_t base,
         }
 
         s_retry_count = 0;
-        s_connected = true;
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -105,6 +122,11 @@ static void event_handler(void *arg, esp_event_base_t base,
 
 esp_err_t wifi_init(void)
 {
+    if (WIFI_SSID[0] == '\0') {
+        ESP_LOGW(TAG, "Wi-Fi is not configured; continuing offline");
+        return ESP_ERR_NOT_FOUND;
+    }
+
     s_event_group = xEventGroupCreate();
     if (!s_event_group)
         return ESP_ERR_NO_MEM;
@@ -125,7 +147,7 @@ esp_err_t wifi_init(void)
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_OPEN,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
 
@@ -139,7 +161,7 @@ esp_err_t wifi_init(void)
     /* 4096: the supervisor also runs http_close_all (TLS teardown) now, and
      * its high-water mark was already down to ~270 bytes at 2048. */
     BaseType_t ok = xTaskCreate(wifi_supervisor_task, "wifi_sup",
-                                4096, NULL, 3, NULL);
+                                4096, NULL, 3, &s_supervisor_task);
     if (ok != pdPASS)
         ESP_LOGE(TAG, "failed to spawn wifi_supervisor_task");
 
@@ -153,7 +175,7 @@ esp_err_t wifi_init(void)
     if (bits & WIFI_CONNECTED_BIT) {
         /* Battery device: let the radio doze between DTIM beacons. Costs
          * ~100-300 ms first-packet latency; wifi_set_low_latency(true)
-         * lifts it for the NFC payment window. */
+         * can lift it temporarily for a latency-sensitive network request. */
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         return ESP_OK;
     }
@@ -164,12 +186,31 @@ esp_err_t wifi_init(void)
 
 bool wifi_is_connected(void)
 {
-    return s_connected;
+    return event_bit_is_set(WIFI_CONNECTED_BIT);
 }
 
 void wifi_set_low_latency(bool on)
 {
     esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+}
+
+void wifi_set_find_my_radio_guard(bool active)
+{
+    if (!s_event_group)
+        return;
+
+    if (active)
+        xEventGroupSetBits(s_event_group, WIFI_FIND_MY_GUARD_BIT);
+    else
+        xEventGroupClearBits(s_event_group, WIFI_FIND_MY_GUARD_BIT);
+
+    esp_err_t err = esp_coex_preference_set(
+        active ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_BALANCE);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "coexistence preference failed: %s", esp_err_to_name(err));
+
+    if (!active && s_supervisor_task)
+        xTaskNotifyGive(s_supervisor_task);
 }
 
 EventGroupHandle_t wifi_get_event_group(void)

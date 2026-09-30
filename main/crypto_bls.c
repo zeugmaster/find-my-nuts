@@ -7,6 +7,8 @@
 #include <blst_aux.h>
 #include <blst_mpi.h>
 #include <mbedtls/sha256.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 /*
  * BLS12-381 crypto suite (keyset v3, version byte 0x02) over the vendored
@@ -334,6 +336,12 @@ static int bls_verify_proofs(void *ctx, size_t n,
             miller_flush(&acc, chunk_qp, chunk_pp, chunk_len);
             chunk_len = 0;
         }
+
+        /* A 32-proof batch on the software BLS path can otherwise keep the
+         * console task runnable for longer than the idle-task watchdog window.
+         * Yield only between complete proof contributions; all accumulator and
+         * hardware-lock invariants remain unchanged. */
+        vTaskDelay(1);
     }
 
     {
@@ -346,6 +354,9 @@ static int bls_verify_proofs(void *ctx, size_t n,
         chunk_pp[chunk_len] = &chunk_p[chunk_len];
         chunk_len++;
         miller_flush(&acc, chunk_qp, chunk_pp, chunk_len);
+
+        /* The final exponentiation is another long indivisible primitive. */
+        vTaskDelay(1);
 
         blst_fp12 gt;
         blst_final_exp(&gt, &acc);

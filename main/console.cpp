@@ -1,11 +1,15 @@
 #include "console.h"
+#include "board.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/usb_serial_jtag.h"
-#include "driver/usb_serial_jtag_vfs.h"
-#include <cstring>
-#include <cstdio>
+#include "driver/uart.h"
+
+#include <atomic>
 #include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define MAX_COMMANDS 32
@@ -26,10 +30,12 @@ static struct {
     std::vector<command_entry> commands;
 } s_con;
 
+static std::atomic_bool s_commands_ready{false};
+
 void nucula_console_write(const char *str)
 {
     if (str)
-        usb_serial_jtag_write_bytes(str, strlen(str), portMAX_DELAY);
+        uart_write_bytes(UART_NUM_0, str, strlen(str));
 }
 
 void console_printf(const char *fmt, ...)
@@ -62,6 +68,11 @@ static void cmd_help(const char *arg)
 
 static void process_command(char *cmd, char *arg)
 {
+    if (!s_commands_ready.load(std::memory_order_acquire)) {
+        nucula_console_write("wallet is still starting; try again shortly\r\n");
+        return;
+    }
+
     for (const auto &entry : s_con.commands) {
         if (strcmp(cmd, entry.name) == 0) {
             entry.handler(arg);
@@ -98,7 +109,7 @@ static void console_task(void *arg)
     int pos = 0;
 
     vTaskDelay(pdMS_TO_TICKS(500));
-    nucula_console_write("\r\nnucula> ");
+    nucula_console_write("\r\nfind-my-nuts> ");
 
     // Read in chunks and batch the echo of printable runs: with per-byte
     // reads and a blocking 1-byte echo write each, a full-speed paste of a
@@ -106,15 +117,15 @@ static void console_task(void *arg)
     // dropping bytes mid-token.
     while (1) {
         uint8_t buf[64];
-        int len = usb_serial_jtag_read_bytes(buf, sizeof(buf),
-                                             20 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(UART_NUM_0, buf, sizeof(buf),
+                                  pdMS_TO_TICKS(20));
         if (len <= 0) continue;
 
         int echo_from = -1;  // start of the unechoed printable run in buf
         auto flush_echo = [&](int upto) {
             if (echo_from >= 0 && upto > echo_from)
-                usb_serial_jtag_write_bytes(&buf[echo_from],
-                                            upto - echo_from, portMAX_DELAY);
+                uart_write_bytes(UART_NUM_0, &buf[echo_from],
+                                 upto - echo_from);
             echo_from = -1;
         };
 
@@ -126,7 +137,7 @@ static void console_task(void *arg)
                 s_con.line_buffer[pos] = '\0';
                 parse_and_run(s_con.line_buffer);
                 pos = 0;
-                nucula_console_write("nucula> ");
+                nucula_console_write("find-my-nuts> ");
             } else if (c == 127 || c == '\b') {
                 flush_echo(i);
                 if (pos > 0) {
@@ -137,7 +148,7 @@ static void console_task(void *arg)
                 flush_echo(i);
                 nucula_console_write("^C\r\n");
                 pos = 0;
-                nucula_console_write("nucula> ");
+                nucula_console_write("find-my-nuts> ");
             } else if (pos < (int)s_con.max_line_length - 1) {
                 s_con.line_buffer[pos++] = c;
                 if (echo_from < 0)
@@ -166,15 +177,32 @@ int console_init(const console_config_t *config)
     s_con.task_stack_size = cfg.task_stack_size;
     s_con.task_priority = cfg.task_priority;
 
-    usb_serial_jtag_driver_config_t usb_config = {
-        .tx_buffer_size = cfg.tx_buffer_size,
-        .rx_buffer_size = cfg.rx_buffer_size,
+    // UART0 through the on-board USB/UART bridge; the board defines TX/RX.
+    uart_config_t uart_config = {
+        .baud_rate = BOARD_UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+        .flags = {},
     };
-    if (usb_serial_jtag_driver_install(&usb_config) != ESP_OK) {
+
+    if (uart_param_config(UART_NUM_0, &uart_config) != ESP_OK ||
+        uart_set_pin(UART_NUM_0, BOARD_UART_TX_PIN, BOARD_UART_RX_PIN,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
         free(s_con.line_buffer);
         return -3;
     }
-    usb_serial_jtag_vfs_use_driver();
+
+    if (uart_driver_install(UART_NUM_0,
+                            static_cast<int>(cfg.rx_buffer_size),
+                            static_cast<int>(cfg.tx_buffer_size),
+                            0, nullptr, 0) != ESP_OK) {
+        free(s_con.line_buffer);
+        return -3;
+    }
 
     console_register_cmd("help", cmd_help, "show this help");
     s_con.initialized = true;
@@ -201,4 +229,9 @@ int console_start(void)
 
     s_con.started = true;
     return 0;
+}
+
+void console_set_ready(void)
+{
+    s_commands_ready.store(true, std::memory_order_release);
 }

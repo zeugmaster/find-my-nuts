@@ -39,6 +39,15 @@ bool wifi_is_connected(void);
 void wifi_set_low_latency(bool on);
 
 /**
+ * Protect an active Find My backlog from Wi-Fi state churn. While active,
+ * existing Wi-Fi connectivity is left untouched, new reconnect scans are
+ * deferred, and ESP32 coexistence gives Bluetooth more RF opportunities.
+ * Releasing the guard restores balanced coexistence and wakes the reconnect
+ * supervisor immediately if the link is down.
+ */
+void wifi_set_find_my_radio_guard(bool active);
+
+/**
  * Returns the FreeRTOS event group whose WIFI_CONNECTED_BIT is set whenever
  * the device is associated and has an IP, and cleared on disconnect. Other
  * tasks can wait on this bit to react to (re)connection events.
@@ -48,4 +57,3 @@ EventGroupHandle_t wifi_get_event_group(void);
 #ifdef __cplusplus
 }
 #endif
-

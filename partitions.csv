@@ -1,4 +1,6 @@
-# Name,   Type, SubType, Offset,  Size,   Flags
-nvs,      data, nvs,     0x9000,  0x26000,
-phy_init, data, phy,     0x2f000, 0x1000,
-factory,  app,  factory, 0x30000, 0x1D0000,
+# Name,   Type, SubType, Offset,  Size,     Flags
+# TTGO T-Display has 16 MiB flash. Keep a generous NVS partition for wallet
+# proofs and the durable Find My outbox, plus a 4 MiB factory application.
+nvs,      data, nvs,     0x9000,  0x40000,
+phy_init, data, phy,     0x49000, 0x1000,
+factory,  app,  factory, 0x50000, 0x400000,

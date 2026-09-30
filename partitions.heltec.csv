@@ -1,0 +1,6 @@
+# Name, Type, SubType, Offset, Size, Flags
+# Fresh wallet NVS lives above the prior Bitle firmware's 0..4 MiB layout.
+# Flashing this profile preserves that old NVS and requires no erase-flash.
+factory,  app,  factory, 0x10000,  0x400000,
+nvs,      data, nvs,     0x500000, 0x40000,
+phy_init, data, phy,     0x540000, 0x1000,

@@ -16,5 +16,5 @@ dependencies:
 direct_dependencies:
 - espressif/cbor
 manifest_hash: 1be1fded3c23823672fbc0604fcfec652c4565ba615e51929782301f0a22fb0c
-target: esp32c3
+target: esp32s3
 version: 2.0.0

@@ -14,21 +14,20 @@ typedef struct {
 } http_response_t;
 
 /**
- * Create the connection-cache mutex. Call once from app_main before any
- * task can issue requests.
+ * Create the HTTP mutex. Call once from app_main before any task can issue
+ * requests.
  */
 void http_init(void);
 
 /**
- * Warm up the TLS connection to a mint (fire-and-forget background task
- * fetching <base_url>/v1/info). Call at the start of an NFC payment window
- * so the post-tap swap reuses an established connection.
+ * Warm up DNS/routing to a mint (fire-and-forget background task fetching
+ * <base_url>/v1/info). This T-Display build has no NFC caller.
  */
 void http_prewarm(const char *base_url);
 
 /**
- * Drop all cached connections (e.g. when WiFi disconnects). Safe from any
- * task; blocks until in-flight requests finish.
+ * Wait for any in-flight one-shot request to finish after Wi-Fi disconnects.
+ * No socket or TLS state is retained between requests.
  */
 void http_close_all(void);
 
@@ -63,4 +62,3 @@ void http_response_free(http_response_t *resp);
 #ifdef __cplusplus
 }
 #endif
-

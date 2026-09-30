@@ -1,29 +1,98 @@
 #include "display.h"
 
 #include <cstring>
-#include <esp_log.h>
+
 #include <driver/gpio.h>
+#include <driver/spi_master.h>
+#include <esp_heap_caps.h>
+#include <esp_lcd_io_spi.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_log.h>
+#include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include "board.h"
+#include "board_tdisplay.h"
 
 #define TAG "display"
 
-#define SSD1309_ADDR  BOARD_OLED_ADDR
-#define SSD1309_CMD   0x00   // control byte: following bytes are commands
-#define SSD1309_DATA  0x40   // control byte: following bytes are GDDRAM data
+namespace {
 
-#define PIN_RST  BOARD_OLED_RST_PIN
+// The verified Arduino setup used the default VSPI peripheral at 40 MHz.
+constexpr spi_host_device_t kLcdHost = SPI3_HOST;
+constexpr int kStripeHeight = 16;
+constexpr int kXOffset = BOARD_TFT_X_OFFSET;
+constexpr int kYOffset = BOARD_TFT_Y_OFFSET;
+constexpr size_t kStripeBytes = LCD_W * kStripeHeight * sizeof(uint16_t);
+constexpr TickType_t kTransferTimeout = pdMS_TO_TICKS(250);
 
-static i2c_master_dev_handle_t s_dev = nullptr;
+esp_lcd_panel_io_handle_t s_io;
+SemaphoreHandle_t s_lock;
+SemaphoreHandle_t s_tx_done;
+uint16_t *s_stripe;
+bool s_initialized;
+bool s_powered;
+bool s_first_frame_sent;
 
-// Page-format framebuffer: 8 pages × 128 columns = 1024 bytes.
+// Page-format one-bit framebuffer. The last page has one unused bit because
+// the panel height is 135 pixels.
 // Each byte holds 8 vertical pixels; bit 0 = topmost in the page.
-static uint8_t s_fb[LCD_H / 8 * LCD_W];
+uint8_t s_fb[((LCD_H + 7) / 8) * LCD_W];
 
-// Transmit buffer: one control byte + framebuffer (static to avoid stack use)
-static uint8_t s_tx[1 + sizeof(s_fb)];
+void lock_display()
+{
+    if (s_lock)
+        xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+}
+
+void unlock_display()
+{
+    if (s_lock)
+        xSemaphoreGiveRecursive(s_lock);
+}
+
+void pixel_locked(int x, int y, bool on)
+{
+    if (x < 0 || x >= LCD_W || y < 0 || y >= LCD_H)
+        return;
+    if (on)
+        s_fb[(y >> 3) * LCD_W + x] |= (1U << (y & 7));
+    else
+        s_fb[(y >> 3) * LCD_W + x] &= ~(1U << (y & 7));
+}
+
+bool IRAM_ATTR color_transfer_done(esp_lcd_panel_io_handle_t,
+                                   esp_lcd_panel_io_event_data_t *, void *)
+{
+    BaseType_t task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_tx_done, &task_woken);
+    if (task_woken == pdTRUE)
+        portYIELD_FROM_ISR(task_woken);
+    return task_woken == pdTRUE;
+}
+
+bool send_command(uint8_t command, const uint8_t *data = nullptr,
+                  size_t data_length = 0)
+{
+    const esp_err_t err = esp_lcd_panel_io_tx_param(
+        s_io, command, data, data_length);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ST7789 command 0x%02x failed: %s", command,
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+void delay_ms(uint32_t delay)
+{
+    const TickType_t ticks = pdMS_TO_TICKS(delay);
+    vTaskDelay(ticks > 0 ? ticks : 1);
+}
+
+} // namespace
 
 // -------------------------------------------------------------------------
 // 5×7 bitmap font (ASCII 32-126, 5 bytes per char, column-major, LSB=top)
@@ -131,116 +200,333 @@ static const uint8_t font5x7[][5] = {
 #define FONT_ADVANCE 6
 
 // -------------------------------------------------------------------------
-// SSD1309 I2C helpers
+// Raw ST7789 panel IO
 // -------------------------------------------------------------------------
 
-static void ssd1309_send_cmds(const uint8_t *cmds, size_t len)
+namespace {
+
+bool initialize_controller()
 {
-    // Prepend command control byte
-    uint8_t buf[32];
-    buf[0] = SSD1309_CMD;
-    size_t chunk;
-    while (len > 0) {
-        chunk = (len > sizeof(buf) - 1) ? sizeof(buf) - 1 : len;
-        memcpy(buf + 1, cmds, chunk);
-        i2c_master_transmit(s_dev, buf, chunk + 1, 100);
-        cmds += chunk;
-        len  -= chunk;
-    }
+    // Match TFT_eSPI 2.2.20's verified hardware-reset timing exactly.
+    gpio_set_level(BOARD_TFT_RST_PIN, 1);
+    esp_rom_delay_us(5000);
+    gpio_set_level(BOARD_TFT_RST_PIN, 0);
+    delay_ms(20);
+    gpio_set_level(BOARD_TFT_RST_PIN, 1);
+    delay_ms(150);
+
+    // Exact command/data sequence from TFT_eSPI 2.2.20 ST7789_Init.h, the
+    // revision that was physically verified on this specific T-Display.
+    static const uint8_t madctl_bgr[] = {0x08};
+    static const uint8_t display_function[] = {0x0A, 0x82};
+    static const uint8_t color_mode[] = {0x55};
+    static const uint8_t porch[] = {0x0C, 0x0C, 0x00, 0x33, 0x33};
+    static const uint8_t gate[] = {0x35};
+    static const uint8_t vcom[] = {0x28};
+    static const uint8_t lcm[] = {0x0C};
+    static const uint8_t vdv_vrh_enable[] = {0x01, 0xFF};
+    static const uint8_t vrh[] = {0x10};
+    static const uint8_t vdv[] = {0x20};
+    static const uint8_t frame_rate[] = {0x0F};
+    static const uint8_t power[] = {0xA4, 0xA1};
+    static const uint8_t positive_gamma[] = {
+        0xD0, 0x00, 0x02, 0x07, 0x0A, 0x28, 0x32,
+        0x44, 0x42, 0x06, 0x0E, 0x12, 0x14, 0x17,
+    };
+    static const uint8_t negative_gamma[] = {
+        0xD0, 0x00, 0x02, 0x07, 0x0A, 0x28, 0x31,
+        0x54, 0x47, 0x0E, 0x1C, 0x17, 0x1B, 0x1E,
+    };
+    static const uint8_t initial_columns[] = {0x00, 0x00, 0x00, 0xE5};
+    static const uint8_t initial_rows[] = {0x00, 0x00, 0x01, 0x3F};
+
+    if (!send_command(0x11)) // SLPOUT
+        return false;
+    delay_ms(120);
+
+    if (!send_command(0x13) || // NORON
+        !send_command(0x36, madctl_bgr, sizeof(madctl_bgr)) ||
+        !send_command(0xB6, display_function, sizeof(display_function)) ||
+        !send_command(0x3A, color_mode, sizeof(color_mode)))
+        return false;
+    delay_ms(10);
+
+    if (!send_command(0xB2, porch, sizeof(porch)) ||
+        !send_command(0xB7, gate, sizeof(gate)) ||
+        !send_command(0xBB, vcom, sizeof(vcom)) ||
+        !send_command(0xC0, lcm, sizeof(lcm)) ||
+        !send_command(0xC2, vdv_vrh_enable, sizeof(vdv_vrh_enable)) ||
+        !send_command(0xC3, vrh, sizeof(vrh)) ||
+        !send_command(0xC4, vdv, sizeof(vdv)) ||
+        !send_command(0xC6, frame_rate, sizeof(frame_rate)) ||
+        !send_command(0xD0, power, sizeof(power)) ||
+        !send_command(0xE0, positive_gamma, sizeof(positive_gamma)) ||
+        !send_command(0xE1, negative_gamma, sizeof(negative_gamma)) ||
+        !send_command(0x21) || // INVON
+        !send_command(0x2A, initial_columns, sizeof(initial_columns)) ||
+        !send_command(0x2B, initial_rows, sizeof(initial_rows)))
+        return false;
+
+    // The historical driver released CS for this delay before DISPON.
+    delay_ms(120);
+    if (!send_command(0x29)) // DISPON
+        return false;
+    delay_ms(120);
+
+    // TFT_eSPI init() applies rotation 0 once, then the known-good app calls
+    // setRotation(1). Preserve both writes and the final landscape MADCTL:
+    // MX | MV | BGR = 0x68. Rotation 1 uses x=40/y=53 CGRAM offsets.
+    if (!send_command(0x36, madctl_bgr, sizeof(madctl_bgr)))
+        return false;
+    esp_rom_delay_us(10);
+    static const uint8_t rotation_1[] = {0x68};
+    if (!send_command(0x36, rotation_1, sizeof(rotation_1)))
+        return false;
+    esp_rom_delay_us(10);
+    return true;
 }
 
-// -------------------------------------------------------------------------
-// Init
-// -------------------------------------------------------------------------
-
-void display_init(i2c_master_bus_handle_t bus)
+bool flush_frame_locked()
 {
-    if (!bus) {
-        ESP_LOGW(TAG, "no I2C bus, display disabled");
+    if (!s_initialized || !s_powered)
+        return false;
+
+    for (int y = 0; y < LCD_H; y += kStripeHeight) {
+        const int rows = (y + kStripeHeight <= LCD_H)
+                             ? kStripeHeight
+                             : LCD_H - y;
+        size_t out = 0;
+        for (int row = 0; row < rows; ++row) {
+            const int source_y = y + row;
+            const uint8_t mask = 1U << (source_y & 7);
+            const int page = (source_y >> 3) * LCD_W;
+            for (int x = 0; x < LCD_W; ++x)
+                s_stripe[out++] = (s_fb[page + x] & mask) ? 0xFFFF : 0x0000;
+        }
+
+        const uint16_t x0 = kXOffset;
+        const uint16_t x1 = kXOffset + LCD_W - 1;
+        const uint16_t y0 = kYOffset + y;
+        const uint16_t y1 = kYOffset + y + rows - 1;
+        const uint8_t columns[] = {
+            static_cast<uint8_t>(x0 >> 8), static_cast<uint8_t>(x0),
+            static_cast<uint8_t>(x1 >> 8), static_cast<uint8_t>(x1),
+        };
+        const uint8_t rows_window[] = {
+            static_cast<uint8_t>(y0 >> 8), static_cast<uint8_t>(y0),
+            static_cast<uint8_t>(y1 >> 8), static_cast<uint8_t>(y1),
+        };
+
+        if (!send_command(0x2A, columns, sizeof(columns)) ||
+            !send_command(0x2B, rows_window, sizeof(rows_window)))
+            return false;
+
+        // Defensive drain in case a previous transfer completed after a
+        // timeout. With queue depth one, this stripe stays valid until the
+        // callback returns its completion token.
+        while (xSemaphoreTake(s_tx_done, 0) == pdTRUE) {
+        }
+        const esp_err_t err = esp_lcd_panel_io_tx_color(
+            s_io, 0x2C, s_stripe, out * sizeof(uint16_t));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ST7789 stripe transfer failed: %s",
+                     esp_err_to_name(err));
+            return false;
+        }
+        if (xSemaphoreTake(s_tx_done,
+                           kTransferTimeout > 0 ? kTransferTimeout : 1) != pdTRUE) {
+            ESP_LOGE(TAG, "ST7789 stripe transfer timed out");
+            return false;
+        }
+    }
+
+    // Never expose reset/uninitialised panel RAM. The backlight comes on only
+    // after a complete first frame (also after waking from sleep).
+    if (!s_first_frame_sent) {
+        gpio_set_level(BOARD_TFT_BACKLIGHT_PIN, 1);
+        s_first_frame_sent = true;
+    }
+    return true;
+}
+
+void set_power_locked(bool on)
+{
+    if (!s_initialized || on == s_powered)
+        return;
+
+    if (!on) {
+        gpio_set_level(BOARD_TFT_BACKLIGHT_PIN, 0);
+        send_command(0x28); // DISPOFF
+        delay_ms(20);
+        send_command(0x10); // SLPIN
+        delay_ms(120);
+        s_powered = false;
+        s_first_frame_sent = false;
         return;
     }
 
-    // Optional hardware reset
-    if ((int)PIN_RST >= 0) {
-        gpio_reset_pin(PIN_RST);
-        gpio_set_direction(PIN_RST, GPIO_MODE_OUTPUT);
-        gpio_set_level(PIN_RST, 0);
-        vTaskDelay(pdMS_TO_TICKS(10));
-        gpio_set_level(PIN_RST, 1);
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    if (!send_command(0x11)) // SLPOUT
+        return;
+    delay_ms(120);
+    if (!send_command(0x29)) // DISPON
+        return;
+    delay_ms(120);
+    s_powered = true;
+    s_first_frame_sent = false;
+    flush_frame_locked();
+}
 
-    // Probe first: on a board without the display every later transmit
-    // would just NACK-spam the shared bus.
-    if (i2c_master_probe(bus, SSD1309_ADDR, 50) != ESP_OK) {
-        ESP_LOGW(TAG, "no display at 0x%02X, display disabled", SSD1309_ADDR);
+} // namespace
+
+// -------------------------------------------------------------------------
+// Init and framebuffer transfer
+// -------------------------------------------------------------------------
+
+void display_init(void)
+{
+    if (!s_lock)
+        s_lock = xSemaphoreCreateRecursiveMutex();
+    if (!s_lock) {
+        ESP_LOGE(TAG, "display mutex allocation failed");
         return;
     }
 
-    // Add SSD1309 as device on the shared I2C bus
-    i2c_device_config_t dev_cfg = {};
-    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    dev_cfg.device_address  = SSD1309_ADDR;
-    dev_cfg.scl_speed_hz    = 400000;
+    lock_display();
+    if (s_initialized) {
+        unlock_display();
+        return;
+    }
 
-    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &s_dev);
+    gpio_config_t output_cfg = {};
+    output_cfg.pin_bit_mask = (1ULL << BOARD_TFT_RST_PIN) |
+                              (1ULL << BOARD_TFT_BACKLIGHT_PIN);
+    output_cfg.mode = GPIO_MODE_OUTPUT;
+    output_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    output_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    output_cfg.intr_type = GPIO_INTR_DISABLE;
+    esp_err_t err = gpio_config(&output_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SSD1309 add failed: %s", esp_err_to_name(err));
-        s_dev = nullptr;
+        ESP_LOGE(TAG, "display GPIO init failed: %s", esp_err_to_name(err));
+        unlock_display();
+        return;
+    }
+    gpio_set_level(BOARD_TFT_BACKLIGHT_PIN, 0);
+    gpio_set_level(BOARD_TFT_RST_PIN, 1);
+
+    if (!s_tx_done)
+        s_tx_done = xSemaphoreCreateBinary();
+    if (!s_stripe)
+        s_stripe = static_cast<uint16_t *>(
+            heap_caps_malloc(kStripeBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    if (!s_tx_done || !s_stripe) {
+        ESP_LOGE(TAG, "DMA stripe/semaphore allocation failed");
+        unlock_display();
         return;
     }
 
-    // SSD1309 initialisation (compatible with SSD1306 modules too)
-    static const uint8_t init[] = {
-        0xAE,              // display off
-        0xD5, 0x80,        // clock divide ratio
-        0xA8, 0x3F,        // multiplex 64
-        0xD3, 0x00,        // display offset 0
-        0x40,              // start line 0
-        0x8D, 0x14,        // charge pump enable
-        0x20, 0x00,        // horizontal addressing mode
-        0xA1,              // segment remap (mirror X)
-        0xC8,              // COM scan reversed (mirror Y)
-        0xDA, 0x12,        // COM pins: alternative, no LR remap
-        0x81, 0xCF,        // contrast
-        0xD9, 0xF1,        // pre-charge period
-        0xDB, 0x40,        // VCOMH deselect level
-        0xA4,              // output follows RAM
-        0xA6,              // normal display (not inverted)
-        0xAF,              // display on
-    };
-    ssd1309_send_cmds(init, sizeof(init));
+    spi_bus_config_t bus_config = {};
+    bus_config.mosi_io_num = BOARD_TFT_MOSI_PIN;
+    bus_config.miso_io_num = -1;
+    bus_config.sclk_io_num = BOARD_TFT_SCLK_PIN;
+    bus_config.quadwp_io_num = -1;
+    bus_config.quadhd_io_num = -1;
+    bus_config.data4_io_num = -1;
+    bus_config.data5_io_num = -1;
+    bus_config.data6_io_num = -1;
+    bus_config.data7_io_num = -1;
+    bus_config.max_transfer_sz = kStripeBytes;
+    bus_config.flags = SPICOMMON_BUSFLAG_MASTER |
+                       SPICOMMON_BUSFLAG_MOSI |
+                       SPICOMMON_BUSFLAG_SCLK;
+
+    err = spi_bus_initialize(kLcdHost, &bus_config, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "display SPI bus init failed: %s", esp_err_to_name(err));
+        unlock_display();
+        return;
+    }
+
+    esp_lcd_panel_io_spi_config_t io_config = {};
+    io_config.cs_gpio_num = BOARD_TFT_CS_PIN;
+    io_config.dc_gpio_num = BOARD_TFT_DC_PIN;
+    io_config.spi_mode = 0;
+    io_config.pclk_hz = BOARD_TFT_CLOCK_HZ;
+    io_config.trans_queue_depth = 1;
+    io_config.on_color_trans_done = color_transfer_done;
+    io_config.user_ctx = nullptr;
+    io_config.lcd_cmd_bits = 8;
+    io_config.lcd_param_bits = 8;
+
+    err = esp_lcd_new_panel_io_spi(
+        static_cast<esp_lcd_spi_bus_handle_t>(kLcdHost), &io_config, &s_io);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "display panel IO init failed: %s", esp_err_to_name(err));
+        unlock_display();
+        return;
+    }
+
+    if (!initialize_controller()) {
+        ESP_LOGE(TAG, "ST7789 initialization failed");
+        unlock_display();
+        return;
+    }
 
     memset(s_fb, 0, sizeof(s_fb));
-    display_update();
+    s_initialized = true;
+    s_powered = true;
+    s_first_frame_sent = false;
+    const bool first_frame_ok = flush_frame_locked();
+    unlock_display();
 
-    ESP_LOGI(TAG, "SSD1309 initialized (%dx%d I2C 0x%02X)", LCD_W, LCD_H, SSD1309_ADDR);
+    if (!first_frame_ok) {
+        ESP_LOGE(TAG, "ST7789 first frame failed; backlight remains off");
+        return;
+    }
+
+    err = board_tdisplay_buttons_init();
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "display button init failed: %s", esp_err_to_name(err));
+
+    ESP_LOGI(TAG,
+             "ST7789 initialized (%dx%d rotation 1, offset %d/%d, 40 MHz)",
+             LCD_W, LCD_H, kXOffset, kYOffset);
 }
-
-// -------------------------------------------------------------------------
-// Framebuffer → display transfer
-// -------------------------------------------------------------------------
 
 void display_update(void)
 {
-    if (!s_dev) return;
+    lock_display();
+    if (s_initialized && s_powered)
+        flush_frame_locked();
+    unlock_display();
+}
 
-    // Set draw window to full screen
-    static const uint8_t window[] = {
-        0x21, 0x00, 0x7F,   // column range 0–127
-        0x22, 0x00, 0x07,   // page range 0–7
-    };
-    ssd1309_send_cmds(window, sizeof(window));
+void display_power(bool on)
+{
+    lock_display();
+    set_power_locked(on);
+    unlock_display();
+}
 
-    // Push framebuffer
-    s_tx[0] = SSD1309_DATA;
-    memcpy(s_tx + 1, s_fb, sizeof(s_fb));
-    i2c_master_transmit(s_dev, s_tx, sizeof(s_tx), 200);
+bool display_is_powered(void)
+{
+    lock_display();
+    const bool powered = s_initialized && s_powered;
+    unlock_display();
+    return powered;
+}
+
+void display_toggle(void)
+{
+    lock_display();
+    set_power_locked(!s_powered);
+    unlock_display();
 }
 
 void display_clear(void)
 {
+    lock_display();
     memset(s_fb, 0, sizeof(s_fb));
+    unlock_display();
 }
 
 // -------------------------------------------------------------------------
@@ -249,21 +535,23 @@ void display_clear(void)
 
 void display_pixel(int x, int y, bool on)
 {
-    if (x < 0 || x >= LCD_W || y < 0 || y >= LCD_H) return;
-    if (on)
-        s_fb[(y >> 3) * LCD_W + x] |=  (1 << (y & 7));
-    else
-        s_fb[(y >> 3) * LCD_W + x] &= ~(1 << (y & 7));
+    lock_display();
+    pixel_locked(x, y, on);
+    unlock_display();
 }
 
 void display_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
+    lock_display();
     int x2 = x + w, y2 = y + h;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x2 > LCD_W) x2 = LCD_W;
     if (y2 > LCD_H) y2 = LCD_H;
-    if (x2 <= x || y2 <= y) return;
+    if (x2 <= x || y2 <= y) {
+        unlock_display();
+        return;
+    }
 
     bool on = (color != 0);
     for (int row = y; row < y2; row++) {
@@ -278,6 +566,7 @@ void display_fill_rect(int x, int y, int w, int h, uint16_t color)
                 s_fb[page_off + col] &= nmask;
         }
     }
+    unlock_display();
 }
 
 void display_hline(int x, int y, int w)
@@ -292,7 +581,9 @@ void display_hline(int x, int y, int w)
 void display_text_color(int x, int y, const char *text,
                         uint16_t fg, uint16_t bg, int scale)
 {
-    if (!text || !*text) return;
+    if (!text || !*text || scale <= 0)
+        return;
+    lock_display();
     bool fg_on = (fg != 0);
     bool bg_on = (bg != 0);
 
@@ -312,10 +603,11 @@ void display_text_color(int x, int y, const char *text,
                 int px = x + col * scale;
                 for (int sy = 0; sy < scale && py + sy < LCD_H; sy++)
                     for (int sx = 0; sx < scale && px + sx < LCD_W; sx++)
-                        display_pixel(px + sx, py + sy, pixel);
+                        pixel_locked(px + sx, py + sy, pixel);
             }
         }
     }
+    unlock_display();
 }
 
 void display_text(int x, int y, const char *text, int scale)
@@ -330,5 +622,7 @@ void display_text_inv(int x, int y, const char *text, int scale)
 
 int display_text_width(const char *text, int scale)
 {
-    return (int)strlen(text) * FONT_ADVANCE * scale;
+    if (!text || scale <= 0)
+        return 0;
+    return static_cast<int>(strlen(text)) * FONT_ADVANCE * scale;
 }

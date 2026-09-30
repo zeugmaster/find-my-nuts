@@ -1,5 +1,10 @@
 # Build output
 build/
+build-*/
+.local/
+sdkconfig.heltec
+sdkconfig.heltec.old
+receiver/.venv/
 
 # ESP-IDF generated config (sdkconfig.defaults is tracked instead)
 sdkconfig
@@ -21,3 +26,7 @@ main/wifi_config.h
 # IDE
 .vscode/
 .idea/
+
+# Receiver test/runtime caches
+__pycache__/
+*.py[cod]

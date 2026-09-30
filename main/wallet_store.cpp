@@ -1,6 +1,7 @@
 #include "wallet_store.hpp"
 
 #include <esp_log.h>
+#include <new>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -20,10 +21,24 @@ bool wallet_store_init(secp256k1_context *ctx)
     }
 
     for (int i = 0; i < MAX_MINTS; i++) {
-        std::string url = cashu::Wallet::load_mint_url_for_slot(i);
-        if (url.empty()) continue;
-        auto *w = new cashu::Wallet(url, s_ctx, i);
-        w->load_from_nvs();
+        std::string url;
+        bool found = false;
+        if (!cashu::Wallet::load_mint_url_for_slot(i, url, found)) {
+            ESP_LOGE(TAG, "wallet slot %d URL restore failed; boot held", i);
+            return false;
+        }
+        if (!found) continue;
+
+        auto *w = new (std::nothrow) cashu::Wallet(url, s_ctx, i);
+        if (!w) {
+            ESP_LOGE(TAG, "wallet slot %d allocation failed; boot held", i);
+            return false;
+        }
+        if (!w->load_from_nvs()) {
+            ESP_LOGE(TAG, "wallet slot %d state restore failed; boot held", i);
+            delete w;
+            return false;
+        }
         s_wallets[i] = w;
         ESP_LOGI(TAG, "restored wallet [%d] %s (%d keysets, %d proofs)",
                  i, url.c_str(), (int)w->keysets().size(),
@@ -87,9 +102,17 @@ cashu::Wallet *wallet_store_get_or_create(const std::string &mint_url)
         return nullptr;
     }
 
-    w = new cashu::Wallet(mint_url, s_ctx, slot);
+    w = new (std::nothrow) cashu::Wallet(mint_url, s_ctx, slot);
+    if (!w) {
+        ESP_LOGE(TAG, "mint slot %d allocation failed", slot);
+        return nullptr;
+    }
+    if (!w->save_mint_url()) {
+        ESP_LOGE(TAG, "could not persist mint URL in slot %d", slot);
+        delete w;
+        return nullptr;
+    }
     s_wallets[slot] = w;
-    w->save_mint_url();
     ESP_LOGI(TAG, "added mint [%d]: %s", slot, mint_url.c_str());
     return w;
 }
@@ -99,7 +122,11 @@ bool wallet_store_remove(int slot)
     cashu::Wallet *w = wallet_store_get(slot);
     if (!w)
         return false;
-    w->erase_nvs();
+    // Keep the in-memory object reachable if flash cleanup fails. Otherwise a
+    // failed transactional mint-add rollback would look successful now but
+    // restore the rejected mint from NVS after reboot.
+    if (!w->erase_nvs())
+        return false;
     delete w;
     s_wallets[slot] = nullptr;
     return true;

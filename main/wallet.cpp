@@ -11,8 +11,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <new>
 #include <esp_log.h>
 #include <esp_random.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <cJSON.h>
@@ -57,22 +62,57 @@ bool Wallet::save_mint_url()
     return err == ESP_OK;
 }
 
-std::string Wallet::load_mint_url_for_slot(int slot)
+bool Wallet::load_mint_url_for_slot(int slot, std::string& url_out, bool& found)
 {
+    url_out.clear();
+    found = false;
+
     nvs_handle_t handle;
-    if (nvs_open(NVS_NS, NVS_READONLY, &handle) != ESP_OK)
-        return "";
+    esp_err_t err = nvs_open(NVS_NS, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+        return true; // First boot: the wallet namespace does not exist yet.
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "load mint slot %d: nvs_open failed: %s",
+                 slot, esp_err_to_name(err));
+        return false;
+    }
+
     char key[16];
     slot_key(key, sizeof(key), "url", slot);
     size_t len = 0;
-    if (nvs_get_str(handle, key, nullptr, &len) != ESP_OK || len == 0) {
+    err = nvs_get_str(handle, key, nullptr, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
         nvs_close(handle);
-        return "";
+        return true; // An unused slot is a normal empty state.
     }
-    std::string url(len - 1, '\0');
-    nvs_get_str(handle, key, url.data(), &len);
+    if (err != ESP_OK || len <= 1
+        || len == std::numeric_limits<size_t>::max()) {
+        ESP_LOGE(TAG, "load mint slot %d: URL length failed: %s (%u bytes)",
+                 slot, esp_err_to_name(err), (unsigned)len);
+        nvs_close(handle);
+        return false;
+    }
+
+    std::unique_ptr<char[]> url(new (std::nothrow) char[len]);
+    if (!url) {
+        ESP_LOGE(TAG, "load mint slot %d: URL allocation failed (%u bytes)",
+                 slot, (unsigned)len);
+        nvs_close(handle);
+        return false;
+    }
+    const size_t expected = len;
+    err = nvs_get_str(handle, key, url.get(), &len);
     nvs_close(handle);
-    return url;
+    if (err != ESP_OK || len != expected || url[len - 1] != '\0'
+        || strlen(url.get()) + 1 != len) {
+        ESP_LOGE(TAG, "load mint slot %d: URL read failed: %s",
+                 slot, esp_err_to_name(err));
+        return false;
+    }
+
+    url_out.assign(url.get(), len - 1);
+    found = true;
+    return true;
 }
 
 // -------------------------------------------------------------------------
@@ -402,27 +442,55 @@ bool Wallet::load_proofs()
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NS, NVS_READONLY, &handle);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[%d] load proofs: nvs_open failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
         return false;
+    }
 
     char key[16];
     slot_key(key, sizeof(key), "proofs", nvs_slot_);
     size_t required = 0;
     err = nvs_get_blob(handle, key, nullptr, &required);
-    if (err != ESP_OK || required == 0) {
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return true; // Configured wallets may legitimately hold no proofs yet.
+    }
+    if (err != ESP_OK || required == 0
+        || required == std::numeric_limits<size_t>::max()) {
+        ESP_LOGE(TAG, "[%d] load proofs: length failed: %s (%u bytes)",
+                 nvs_slot_, esp_err_to_name(err), (unsigned)required);
         nvs_close(handle);
         return false;
     }
 
-    std::string blob(required, '\0');
-    err = nvs_get_blob(handle, key, blob.data(), &required);
-    nvs_close(handle);
-    if (err != ESP_OK)
+    std::unique_ptr<char[]> blob(new (std::nothrow) char[required + 1]);
+    if (!blob) {
+        ESP_LOGE(TAG, "[%d] load proofs: allocation failed (%u bytes)",
+                 nvs_slot_, (unsigned)required);
+        nvs_close(handle);
         return false;
+    }
+    const size_t expected = required;
+    err = nvs_get_blob(handle, key, blob.get(), &required);
+    nvs_close(handle);
+    if (err != ESP_OK || required != expected) {
+        ESP_LOGE(TAG, "[%d] load proofs: blob read failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
+        return false;
+    }
+    if (memchr(blob.get(), '\0', required) != nullptr) {
+        ESP_LOGE(TAG, "[%d] load proofs: stored JSON contains embedded NUL",
+                 nvs_slot_);
+        return false;
+    }
+    blob[required] = '\0';
 
     std::vector<Proof> loaded;
-    if (!proofs_from_json(blob.c_str(), loaded))
+    if (!proofs_from_json(blob.get(), loaded)) {
+        ESP_LOGE(TAG, "[%d] load proofs: stored JSON is invalid", nvs_slot_);
         return false;
+    }
 
     proofs_ = std::move(loaded);
     ESP_LOGI(TAG, "[%d] loaded %d proofs from NVS", nvs_slot_, (int)proofs_.size());
@@ -520,8 +588,11 @@ bool Wallet::load_keysets_nvs()
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NS, NVS_READONLY, &handle);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[%d] load keysets: nvs_open failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
         return false;
+    }
 
     // Try individual-entry format first
     char cnt_key[16];
@@ -529,30 +600,69 @@ bool Wallet::load_keysets_nvs()
     uint8_t count = 0;
     err = nvs_get_u8(handle, cnt_key, &count);
 
+    if (err == ESP_OK && count > MAX_KEYSETS) {
+        ESP_LOGE(TAG, "[%d] load keysets: invalid count %u",
+                 nvs_slot_, (unsigned)count);
+        nvs_close(handle);
+        return false;
+    }
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "[%d] load keysets: count read failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
+        nvs_close(handle);
+        return false;
+    }
+
     if (err == ESP_OK && count > 0) {
         std::vector<Keyset> loaded;
-        for (int i = 0; i < count && i < MAX_KEYSETS; i++) {
+        for (int i = 0; i < count; i++) {
             char ks_key[16];
             snprintf(ks_key, sizeof(ks_key), "k_%d_%d", nvs_slot_, i);
             size_t required = 0;
-            if (nvs_get_blob(handle, ks_key, nullptr, &required) != ESP_OK
-                || required == 0)
-                continue;
-            std::string blob(required, '\0');
-            if (nvs_get_blob(handle, ks_key, blob.data(), &required) != ESP_OK)
-                continue;
+            esp_err_t item_err = nvs_get_blob(handle, ks_key, nullptr, &required);
+            if (item_err != ESP_OK || required == 0
+                || required == std::numeric_limits<size_t>::max()) {
+                ESP_LOGE(TAG, "[%d] load keysets: entry %d length failed: %s",
+                         nvs_slot_, i, esp_err_to_name(item_err));
+                nvs_close(handle);
+                return false;
+            }
+            std::unique_ptr<char[]> blob(new (std::nothrow) char[required + 1]);
+            if (!blob) {
+                ESP_LOGE(TAG, "[%d] load keysets: entry %d allocation failed",
+                         nvs_slot_, i);
+                nvs_close(handle);
+                return false;
+            }
+            const size_t expected = required;
+            item_err = nvs_get_blob(handle, ks_key, blob.get(), &required);
+            if (item_err != ESP_OK || required != expected) {
+                ESP_LOGE(TAG, "[%d] load keysets: entry %d read failed: %s",
+                         nvs_slot_, i, esp_err_to_name(item_err));
+                nvs_close(handle);
+                return false;
+            }
+            if (memchr(blob.get(), '\0', required) != nullptr) {
+                ESP_LOGE(TAG, "[%d] load keysets: entry %d contains embedded NUL",
+                         nvs_slot_, i);
+                nvs_close(handle);
+                return false;
+            }
+            blob[required] = '\0';
             Keyset ks{};
-            if (deserialize(blob.c_str(), ks))
-                loaded.push_back(std::move(ks));
+            if (!deserialize(blob.get(), ks)) {
+                ESP_LOGE(TAG, "[%d] load keysets: entry %d is invalid",
+                         nvs_slot_, i);
+                nvs_close(handle);
+                return false;
+            }
+            loaded.push_back(std::move(ks));
         }
         nvs_close(handle);
-        if (!loaded.empty()) {
-            keysets_ = std::move(loaded);
-            ESP_LOGI(TAG, "[%d] loaded %d keysets from NVS",
-                     nvs_slot_, (int)keysets_.size());
-            return true;
-        }
-        return false;
+        keysets_ = std::move(loaded);
+        ESP_LOGI(TAG, "[%d] loaded %d keysets from NVS",
+                 nvs_slot_, (int)keysets_.size());
+        return true;
     }
 
     // Fall back to legacy single-blob format
@@ -560,20 +670,44 @@ bool Wallet::load_keysets_nvs()
     slot_key(key, sizeof(key), "keys", nvs_slot_);
     size_t required = 0;
     err = nvs_get_blob(handle, key, nullptr, &required);
-    if (err != ESP_OK || required == 0) {
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return true; // A newly configured wallet may not have keysets yet.
+    }
+    if (err != ESP_OK || required == 0
+        || required == std::numeric_limits<size_t>::max()) {
+        ESP_LOGE(TAG, "[%d] load keysets: legacy length failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
         nvs_close(handle);
         return false;
     }
 
-    std::string blob(required, '\0');
-    err = nvs_get_blob(handle, key, blob.data(), &required);
-    nvs_close(handle);
-    if (err != ESP_OK)
+    std::unique_ptr<char[]> blob(new (std::nothrow) char[required + 1]);
+    if (!blob) {
+        ESP_LOGE(TAG, "[%d] load keysets: legacy allocation failed", nvs_slot_);
+        nvs_close(handle);
         return false;
+    }
+    const size_t expected = required;
+    err = nvs_get_blob(handle, key, blob.get(), &required);
+    nvs_close(handle);
+    if (err != ESP_OK || required != expected) {
+        ESP_LOGE(TAG, "[%d] load keysets: legacy read failed: %s",
+                 nvs_slot_, esp_err_to_name(err));
+        return false;
+    }
+    if (memchr(blob.get(), '\0', required) != nullptr) {
+        ESP_LOGE(TAG, "[%d] load keysets: legacy JSON contains embedded NUL",
+                 nvs_slot_);
+        return false;
+    }
+    blob[required] = '\0';
 
     std::vector<Keyset> loaded;
-    if (!keysets_from_json(blob.c_str(), loaded))
+    if (!keysets_from_json(blob.get(), loaded)) {
+        ESP_LOGE(TAG, "[%d] load keysets: legacy JSON is invalid", nvs_slot_);
         return false;
+    }
 
     keysets_ = std::move(loaded);
     ESP_LOGI(TAG, "[%d] loaded %d keysets from NVS (legacy)",
@@ -614,9 +748,10 @@ bool Wallet::merge_keysets(const std::vector<Keyset>& fresh)
 
 bool Wallet::load_from_nvs()
 {
-    load_proofs();
-    load_keysets_nvs();
-    return !keysets_.empty() || !proofs_.empty();
+    // Missing proof/keyset keys are a legitimate empty configured wallet.
+    // Any other read/parse/allocation failure is ambiguous ownership state and
+    // must propagate to app_main before outbox reconciliation or BLE startup.
+    return load_proofs() && load_keysets_nvs();
 }
 
 const Keyset* Wallet::keyset_for_id(const std::string& id) const
@@ -690,9 +825,15 @@ bool Wallet::load_keysets()
         }
         cJSON* kjson = cJSON_Parse(kresp.body);
         http_response_free(&kresp);
-        if (kjson) {
-            from_json_keyset_response(kjson, keys_resp);
-            cJSON_Delete(kjson);
+        if (!kjson) {
+            ESP_LOGE(TAG, "failed to parse /v1/keys JSON");
+            return false;
+        }
+        bool parsed = from_json_keyset_response(kjson, keys_resp);
+        cJSON_Delete(kjson);
+        if (!parsed || keys_resp.empty()) {
+            ESP_LOGE(TAG, "no keysets in /v1/keys response");
+            return false;
         }
     }
 
@@ -785,10 +926,17 @@ bool Wallet::load_keysets()
                  (int)k.keys.size(), k.input_fee_ppk);
     }
 
+    // merge_keysets copied the fetched maps into their durable in-memory
+    // owners. Release the duplicate 64-key response before JSON persistence
+    // asks for one contiguous output buffer.
+    std::vector<Keyset>().swap(result);
+
     // Each refresh used to rewrite every keyset blob (~16 KB of flash
     // writes) even when nothing changed — which is the common case.
-    if (changed)
-        save_keysets();
+    if (changed && !save_keysets()) {
+        ESP_LOGE(TAG, "keysets loaded but could not be persisted");
+        return false;
+    }
     return true;
 }
 
@@ -927,6 +1075,11 @@ bool Wallet::generate_outputs(const std::vector<int>& amounts,
         out.outputs.push_back(BlindedMessage{amt, std::string(B_hex), keyset_id});
         out.secrets.push_back(secret);
         out.blinding_factors.push_back(std::string(r_hex));
+
+        // BLS hash-to-curve + scalar multiplication is slow on the portable
+        // classic-ESP32 path. Feed the idle-task watchdog between outputs.
+        if (suite->verify_proofs)
+            vTaskDelay(1);
     }
 
     if (deterministic) {
@@ -1095,6 +1248,11 @@ bool Wallet::unblind_signatures(const std::vector<BlindSignature>& signatures,
             };
         }
         proofs_out.push_back(std::move(proof));
+
+        // Keep large exact BLS distributions cooperative during the per-proof
+        // unblinding pass; batch verification below yields internally too.
+        if (suite->verify_proofs)
+            vTaskDelay(1);
     }
 
     if (suite->verify_proofs && !batch_secrets.empty()) {
@@ -1802,6 +1960,20 @@ bool Wallet::check_mint_quote(const std::string& quote_id,
 
 bool Wallet::mint_tokens(const MintQuote& quote, int amount)
 {
+    if (amount <= 0) {
+        ESP_LOGE(TAG, "mint_tokens: amount must be greater than zero");
+        return false;
+    }
+    return mint_tokens(quote, split_amount(amount), nullptr);
+}
+
+bool Wallet::mint_tokens(const MintQuote& quote,
+                         const std::vector<int>& exact_amounts,
+                         std::vector<Proof>* newly_minted)
+{
+    if (newly_minted)
+        newly_minted->clear();
+
     const std::string unit = quote.unit.empty() ? std::string("sat") : quote.unit;
     const std::string method = quote.method.empty() ? std::string("bolt11")
                                                     : quote.method;
@@ -1816,9 +1988,35 @@ bool Wallet::mint_tokens(const MintQuote& quote, int amount)
         return false;
     }
 
-    auto amounts = split_amount(amount);
+    if (exact_amounts.empty()) {
+        ESP_LOGE(TAG, "mint_tokens: output distribution is empty");
+        return false;
+    }
+
+    int64_t total = 0;
+    for (int amount : exact_amounts) {
+        if (amount <= 0) {
+            ESP_LOGE(TAG, "mint_tokens: output amounts must be positive");
+            return false;
+        }
+        if (total > std::numeric_limits<int>::max() - static_cast<int64_t>(amount)) {
+            ESP_LOGE(TAG, "mint_tokens: output total exceeds supported range");
+            return false;
+        }
+        total += amount;
+
+        // Do this before generate_outputs: unsupported denominations must not
+        // consume deterministic counters, much less reach the mint POST.
+        std::string unused_key;
+        if (!keyset_key_hex_for_amount(*ks, static_cast<uint64_t>(amount),
+                                       unused_key)) {
+            ESP_LOGE(TAG, "mint_tokens: denomination %d is unsupported", amount);
+            return false;
+        }
+    }
+
     BlindingData blinding;
-    if (!generate_outputs(amounts, ks->id, blinding))
+    if (!generate_outputs(exact_amounts, ks->id, blinding))
         return false;
 
     MintRequest req{quote.quote, blinding.outputs};
@@ -1850,6 +2048,25 @@ bool Wallet::mint_tokens(const MintQuote& quote, int amount)
         return false;
     }
 
+    // A successful exact-distribution call must produce exactly the requested
+    // denominations in output order. Besides preserving the caller contract,
+    // checking here prevents unblinding a response under a different amount
+    // key than the one requested for its blinded message.
+    if (mint_resp.signatures.size() != blinding.outputs.size()) {
+        ESP_LOGE(TAG, "mint: signature count (%d) != requested output count (%d)",
+                 static_cast<int>(mint_resp.signatures.size()),
+                 static_cast<int>(blinding.outputs.size()));
+        return false;
+    }
+    for (size_t i = 0; i < mint_resp.signatures.size(); i++) {
+        if (mint_resp.signatures[i].amount != blinding.outputs[i].amount) {
+            ESP_LOGE(TAG, "mint: signature[%d] amount %d != requested %d",
+                     static_cast<int>(i), mint_resp.signatures[i].amount,
+                     blinding.outputs[i].amount);
+            return false;
+        }
+    }
+
     std::vector<Proof> new_proofs;
     if (!unblind_signatures(mint_resp.signatures, blinding, *ks, new_proofs))
         return false;
@@ -1864,7 +2081,14 @@ bool Wallet::mint_tokens(const MintQuote& quote, int amount)
     char amt[48];
     format_amount(amt, sizeof(amt), proofs_sum(new_proofs), unit.c_str());
     ESP_LOGI(TAG, "minted %s (%d proofs)", amt, (int)new_proofs.size());
-    save_proofs();
+    if (!save_proofs()) {
+        // Keep the newly issued proofs in RAM for manual recovery, but never
+        // report a durable mint success or hand them to the outbox.
+        ESP_LOGE(TAG, "mint: issued proofs are only in RAM; NVS save failed");
+        return false;
+    }
+    if (newly_minted)
+        *newly_minted = new_proofs;
     return true;
 }
 
@@ -2119,6 +2343,21 @@ bool Wallet::clear_proofs()
 
 bool Wallet::remove_proofs(const std::vector<Proof>& to_remove)
 {
+    // Refuse a stale or mismatched ownership handoff. Silently succeeding when
+    // even one requested secret is absent could activate an outbox copy while
+    // leaving the intended wallet proof spendable (or remove a different set
+    // than the caller believes it reserved).
+    for (const auto& requested : to_remove) {
+        auto present = std::find_if(proofs_.begin(), proofs_.end(),
+                                    [&](const Proof& candidate) {
+                                        return candidate.secret == requested.secret;
+                                    });
+        if (present == proofs_.end()) {
+            ESP_LOGE(TAG, "remove_proofs: requested proof is not in wallet");
+            return false;
+        }
+    }
+
     std::vector<Proof> kept;
     kept.reserve(proofs_.size());
     for (const auto& p : proofs_) {
